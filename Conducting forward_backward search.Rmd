@@ -1,0 +1,404 @@
+---
+title: "Conducting forward/backward search"
+author: "Darius J. Ledbetter"
+date: "2025-10-27"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+# Core libs
+library(httr); library(jsonlite); library(dplyr); library(purrr); library(tibble)
+library(future); library(furrr)
+future::plan(future::sequential)  # safe for knitting
+
+
+
+# --- Abstract helpers ---
+reconstruct_abstract <- function(inv) {
+  if (is.null(inv) || length(inv) == 0) return(NA_character_)
+  positions <- lapply(inv, function(v) {
+    v <- suppressWarnings(as.integer(unlist(v)))
+    v[!is.na(v)]
+  })
+  if (length(positions) == 0 || all(lengths(positions) == 0)) return(NA_character_)
+  maxpos <- max(unlist(positions)) + 1L
+  if (!is.finite(maxpos) || maxpos <= 0) return(NA_character_)
+  slots <- rep("", maxpos)
+  for (w in names(positions)) {
+    idx <- positions[[w]]
+    if (length(idx)) {
+      idx <- idx + 1L
+      idx <- idx[idx >= 1 & idx <= length(slots)]
+      if (length(idx)) slots[idx] <- w
+    }
+  }
+  out <- paste(trimws(slots), collapse = " ")
+  if (nzchar(out)) out else NA_character_
+}
+safe_reconstruct <- function(x) {
+  tryCatch(reconstruct_abstract(x), error = function(e) NA_character_)
+}
+
+# --- Core OpenAlex helpers ---
+get_openalex_work <- function(doi, mailto = NULL) {
+  url <- paste0("https://api.openalex.org/works/doi:", doi)
+  q <- list()
+  if (!is.null(mailto)) q$mailto <- mailto
+  res <- GET(url, query = q)
+  if (status_code(res) != 200) {
+    warning(paste("Could not retrieve work for", doi, "status:", status_code(res)))
+    return(NULL)
+  }
+  fromJSON(content(res, "text", encoding = "UTF-8"), simplifyVector = FALSE)
+}
+
+get_openalex_id <- function(doi, mailto = NULL) {
+  # (kept for forward-citations)
+  url <- paste0("https://api.openalex.org/works/doi:", doi)
+  q <- list()
+  if (!is.null(mailto)) q$mailto <- mailto
+  res <- GET(url, query = q)
+  if (status_code(res) != 200) {
+    warning(paste("No data for", doi))
+    return(tibble(doi = doi, openalex_id = NA_character_))
+  }
+  dat <- fromJSON(content(res, "text", encoding = "UTF-8"))
+  tibble(doi = doi, openalex_id = dat$id)
+}
+
+# --- Forward citations (cursor pagination) ---
+get_forward_citations <- function(doi, per_page = 200, sleep_sec = 0.15, mailto = NULL) {
+  wi <- get_openalex_id(doi, mailto = mailto)
+  if (is.na(wi$openalex_id)) {
+    warning(paste("No OpenAlex ID found for", doi)); return(NULL)
+  }
+  work_id <- sub("^https?://openalex\\.org/", "", wi$openalex_id)
+
+  cursor <- "*"; all_rows <- list(); page_idx <- 1L
+  repeat {
+    q <- list(filter = paste0("cites:", work_id), per_page = per_page, cursor = cursor)
+    if (!is.null(mailto)) q$mailto <- mailto
+    res <- GET("https://api.openalex.org/works", query = q)
+    if (status_code(res) != 200) { warning(paste("Request failed on page", page_idx, "for", doi)); break }
+    dat <- fromJSON(content(res, "text", encoding = "UTF-8"), simplifyVector = FALSE)
+    results <- dat$results
+    if (is.null(results) || length(results) == 0) { if (page_idx == 1L) message(paste("No forward citations for", doi)); break }
+
+    chunk <- tibble(
+      seed_doi          = doi,
+      citing_work_id    = map_chr(results, ~ pluck(.x, "id", .default = NA_character_)),
+      citing_doi        = map_chr(results, ~ pluck(.x, "doi", .default = NA_character_)),
+      title             = map_chr(results, ~ pluck(.x, "title", .default = NA_character_)),
+      publication_year  = map_int(results, ~ pluck(.x, "publication_year", .default = NA_integer_)),
+      cited_by_count    = map_int(results, ~ pluck(.x, "cited_by_count", .default = NA_integer_)),
+      journal           = map_chr(results, ~ pluck(.x, "host_venue", "display_name", .default = NA_character_)),
+      first_author      = map_chr(results, ~ pluck(.x, "authorships", 1, "author", "display_name", .default = NA_character_)),
+      abstract          = map_chr(results, ~ safe_reconstruct(pluck(.x, "abstract_inverted_index", .default = NULL)))
+    )
+    all_rows[[length(all_rows) + 1L]] <- chunk
+
+    next_cursor <- pluck(dat, "meta", "next_cursor", .default = NULL)
+    if (is.null(next_cursor) || identical(next_cursor, "")) break
+    cursor <- next_cursor; page_idx <- page_idx + 1L; Sys.sleep(sleep_sec)
+  }
+  if (length(all_rows) == 0) return(NULL)
+  bind_rows(all_rows)
+}
+
+# --- Backward citations (single-request per reference) ---
+get_backward_citations <- function(doi, sleep_sec = 0.1, mailto = NULL) {
+  work <- get_openalex_work(doi, mailto = mailto)
+  if (is.null(work)) { warning(paste("No work found for", doi)); return(NULL) }
+  refs <- work$referenced_works
+  if (is.null(refs) || length(refs) == 0) { message(paste("No backward refs for", doi)); return(NULL) }
+
+  ref_ids <- sub("^https?://openalex\\.org/", "", refs)
+  out <- vector("list", length(ref_ids))
+
+  for (i in seq_along(ref_ids)) {
+    wid <- ref_ids[[i]]
+    q <- list(); if (!is.null(mailto)) q$mailto <- mailto
+    res <- GET(paste0("https://api.openalex.org/works/", wid), query = q)
+    if (status_code(res) != 200) { out[[i]] <- NULL; next }
+    dat <- fromJSON(content(res, "text", encoding = "UTF-8"), simplifyVector = FALSE)
+    out[[i]] <- tibble(
+      seed_doi          = doi,
+      cited_work_id     = pluck(dat, "id", .default = NA_character_),
+      cited_doi         = pluck(dat, "doi", .default = NA_character_),
+      title             = pluck(dat, "title", .default = NA_character_),
+      publication_year  = pluck(dat, "publication_year", .default = NA_integer_),
+      cited_by_count    = pluck(dat, "cited_by_count", .default = NA_integer_),
+      journal           = pluck(dat, "host_venue", "display_name", .default = NA_character_),
+      first_author      = pluck(dat, "authorships", 1, "author", "display_name", .default = NA_character_),
+      abstract          = safe_reconstruct(pluck(dat, "abstract_inverted_index", .default = NULL))
+    )
+    Sys.sleep(sleep_sec)
+  }
+  out <- purrr::compact(out)
+  if (length(out) == 0) return(NULL)
+  bind_rows(out)
+}
+
+```
+
+
+```{r}
+R.version.string
+
+pkgbuild::find_rtools()
+```
+
+# Step 2: 
+
+## Below just use te doi of your paper
+
+### Setting my seed articels so these are the most relevant articles to my research and all of the forward and backwards searching will be based off of these articles in THIS LIST BELOW
+```{r}
+my_seed_articles <- c(
+  "10.1016/j.foreco.2025.122754", # Connecting growth and yield models to continuous forest inventory data to better account for uncertainty By: Itter
+  "10.1002/eap.70084", # Toward improved uncertainty quantification in predictions of forest dynamics: A dynamical model of forest change By. Itter
+  "10.1016/j.foreco.2012.09.043", # Bayesian calibration, comparison and averaging of six forest models, using data from Scots pine stands across Europe By: Van Oijen
+  "10.1007/s40725-017-0069-9", # Bayesian Methods for Quantifying and Reducing Uncertainty and Error in Forest Models By: Van Oijen
+  "10.1093/treephys/25.7.915", #Bayesian calibration of process-based forest models: bridging the gap between models and data By: Van Oijen
+  "10.5849/forsci.11-123" # Matrix Model of Forest Dynamics: An Overview and Outlook By: Liang
+)
+```
+
+# Swithcing to OpenAlex! Becuase no token is required still keeping the above code incase I get a token
+
+```{r}
+library(httr)
+library(tidyverse)
+library(purrr)
+library(jsonlite)
+library(conflicted)
+```
+```{r}
+my_seed_articles <- c(
+  "10.1016/j.foreco.2025.122754", # Connecting growth and yield models to continuous forest inventory data to better account for uncertainty By: Itter
+  "10.1002/eap.70084", # Toward improved uncertainty quantification in predictions of forest dynamics: A dynamical model of forest change By. Itter
+  "10.1016/j.foreco.2012.09.043", # Bayesian calibration, comparison and averaging of six forest models, using data from Scots pine stands across Europe By: Van Oijen
+  "10.1007/s40725-017-0069-9", # Bayesian Methods for Quantifying and Reducing Uncertainty and Error in Forest Models By: Van Oijen
+  "10.1093/treephys/25.7.915", #Bayesian calibration of process-based forest models: bridging the gap between models and data By: Van Oijen
+  "10.5849/forsci.11-123" # Matrix Model of Forest Dynamics: An Overview and Outlook
+)
+```
+
+# Get OpenAlex data for a DOI
+
+
+### Trying to get the backward results to work now!
+```{r}
+# --- Backward citations with metadata (single-request version) ---
+get_backward_citations <- function(doi, sleep_sec = 0.1, mailto = NULL) {
+  # 1) Get the seed work
+  work <- get_openalex_work(doi, mailto = mailto)
+  if (is.null(work)) {
+    warning(paste("No work found for", doi))
+    return(NULL)
+  }
+
+  refs <- work$referenced_works
+  if (is.null(refs) || length(refs) == 0) {
+    message(paste("No backward (referenced) works found for", doi))
+    return(NULL)
+  }
+
+  # Convert URLs like https://openalex.org/W123 → "W123"
+  ref_ids <- sub("^https?://openalex\\.org/", "", refs)
+
+    # 2️⃣ Parallel fetch for each reference
+  plan(multisession, workers = parallel::detectCores() - 1)
+
+  fetch_one_ref <- function(wid) {
+    url <- paste0("https://api.openalex.org/works/", wid)
+    q <- list()
+    if (!is.null(mailto)) q$mailto <- mailto
+    res <- httr::GET(url, query = q)
+    if (httr::status_code(res) != 200) return(NULL)
+    dat <- jsonlite::fromJSON(httr::content(res, "text", encoding = "UTF-8"), simplifyVector = FALSE)
+    tibble::tibble(
+      seed_doi          = doi,
+      cited_work_id     = purrr::pluck(dat, "id", .default = NA_character_),
+      cited_doi         = purrr::pluck(dat, "doi", .default = NA_character_),
+      title             = purrr::pluck(dat, "title", .default = NA_character_),
+      publication_year  = purrr::pluck(dat, "publication_year", .default = NA_integer_),
+      cited_by_count    = purrr::pluck(dat, "cited_by_count", .default = NA_integer_),
+      journal           = purrr::pluck(dat, "host_venue", "display_name", .default = NA_character_),
+      first_author      = purrr::pluck(dat, "authorships", 1, "author", "display_name", .default = NA_character_),
+      abstract          = safe_reconstruct(purrr::pluck(dat, "abstract_inverted_index", .default = NULL))
+    )
+  }
+
+  message(sprintf("Fetching %d backward citations for %s in parallel...", length(ref_ids), doi))
+  results <- future_map(ref_ids, fetch_one_ref, .progress = TRUE)
+  plan(sequential)  # reset plan afterward
+
+  # Combine all results
+  results <- purrr::compact(results)
+  if (length(results) == 0) return(NULL)
+  dplyr::bind_rows(results)
+
+}
+```
+
+
+# Forward citations: works that cite this paper
+```{r}
+get_openalex_id <- function(doi) {
+  url <- paste0("https://api.openalex.org/works/doi:", doi)
+  res <- GET(url)
+  if (status_code(res) != 200) {
+    warning(paste("No data for", doi))
+    return(tibble(doi = doi, openalex_id = NA))
+  }
+  dat <- fromJSON(content(res, "text", encoding = "UTF-8"))
+  tibble(
+    doi = doi,
+    openalex_id = dat$id
+  )
+}
+
+work_ids <- map_dfr(my_seed_articles, get_openalex_id)
+View(work_ids)
+```
+
+```{r}
+# ---- Abstract helpers ----
+# Rebuild abstract from OpenAlex's inverted index safely
+reconstruct_abstract <- function(inv) {
+  if (is.null(inv) || length(inv) == 0) return(NA_character_)
+  positions <- lapply(inv, function(v) {
+    v <- suppressWarnings(as.integer(unlist(v)))
+    v[!is.na(v)]
+  })
+  if (length(positions) == 0 || all(lengths(positions) == 0)) return(NA_character_)
+  maxpos <- max(unlist(positions)) + 1L
+  if (!is.finite(maxpos) || maxpos <= 0) return(NA_character_)
+  slots <- rep("", maxpos)
+  for (w in names(positions)) {
+    idx <- positions[[w]]
+    if (length(idx)) {
+      idx <- idx + 1L
+      idx <- idx[idx >= 1 & idx <= length(slots)]
+      if (length(idx)) slots[idx] <- w
+    }
+  }
+  out <- paste(trimws(slots), collapse = " ")
+  if (nzchar(out)) out else NA_character_
+}
+
+# Never let a bad abstract crash the run
+safe_reconstruct <- function(x) {
+  tryCatch(reconstruct_abstract(x), error = function(e) NA_character_)
+}
+
+# ---- DOI -> OpenAlex Work ID ----
+get_openalex_id <- function(doi, mailto = NULL) {
+  url <- paste0("https://api.openalex.org/works/doi:", doi)
+  q <- list()
+  if (!is.null(mailto)) q$mailto <- mailto
+  res <- GET(url, query = q)
+  if (status_code(res) != 200) {
+    warning(paste("No data for", doi))
+    return(tibble(doi = doi, openalex_id = NA_character_))
+  }
+  dat <- fromJSON(content(res, "text", encoding = "UTF-8"))
+  tibble(doi = doi, openalex_id = dat$id)
+}
+
+# ---- Forward citations with pagination + extra metadata ----
+get_forward_citations <- function(doi, per_page = 200, sleep_sec = 0.15, mailto = NULL) {
+  # 1) Resolve DOI -> Work ID
+  work_info <- get_openalex_id(doi, mailto = mailto)
+  if (is.na(work_info$openalex_id)) {
+    warning(paste("No OpenAlex ID found for", doi))
+    return(NULL)
+  }
+  work_id <- sub("^https?://openalex\\.org/", "", work_info$openalex_id)
+
+  # 2) Cursor pagination
+  cursor <- "*"
+  all_rows <- list()
+  page_idx <- 1L
+
+  repeat {
+    q <- list(
+      filter   = paste0("cites:", work_id),
+      per_page = per_page,
+      cursor   = cursor
+    )
+    if (!is.null(mailto)) q$mailto <- mailto
+
+    res <- GET("https://api.openalex.org/works", query = q)
+    if (status_code(res) != 200) {
+      warning(paste("Request failed on page", page_idx, "for", doi))
+      break
+    }
+
+    # Keep lists as lists; we'll pluck only scalars
+    dat <- fromJSON(content(res, "text", encoding = "UTF-8"), simplifyVector = FALSE)
+    results <- dat$results
+    if (is.null(results) || length(results) == 0) {
+      if (page_idx == 1L) message(paste("No forward citations found for", doi))
+      break
+    }
+
+    # 3) Extract scalar/safe fields + reconstructed abstract
+    chunk <- tibble(
+      seed_doi          = doi,
+      citing_work_id    = map_chr(results, ~ pluck(.x, "id", .default = NA_character_)),
+      citing_doi        = map_chr(results, ~ pluck(.x, "doi", .default = NA_character_)),
+      title             = map_chr(results, ~ pluck(.x, "title", .default = NA_character_)),
+      publication_year  = map_int(results, ~ pluck(.x, "publication_year", .default = NA_integer_)),
+      cited_by_count    = map_int(results, ~ pluck(.x, "cited_by_count", .default = NA_integer_)),
+      journal           = map_chr(results, ~ pluck(.x, "host_venue", "display_name", .default = NA_character_)),
+      first_author      = map_chr(results, ~ pluck(.x, "authorships", 1, "author", "display_name", .default = NA_character_)),
+      abstract          = map_chr(results, ~ safe_reconstruct(pluck(.x, "abstract_inverted_index", .default = NULL)))
+    )
+
+    all_rows[[length(all_rows) + 1L]] <- chunk
+
+    # 4) Advance cursor
+    next_cursor <- pluck(dat, "meta", "next_cursor", .default = NULL)
+    if (is.null(next_cursor) || identical(next_cursor, "")) break
+    cursor <- next_cursor
+    page_idx <- page_idx + 1L
+    Sys.sleep(sleep_sec)  # be nice to the API
+  }
+
+  if (length(all_rows) == 0) return(NULL)
+  bind_rows(all_rows)
+}
+
+```
+
+```{r}
+# Backward (references cited by each seed paper)
+
+backward_results <- purrr::map(my_seed_articles, ~ get_backward_citations(.x)) |>
+  purrr::compact() |>
+  dplyr::bind_rows()
+
+# Forward (papers that cite each seed paper)
+
+forward_results <- purrr::map(my_seed_articles, ~ get_forward_citations(.x)) |>
+  purrr::compact() |>
+  dplyr::bind_rows()
+```
+
+```{r}
+head(backward_results)
+head(forward_results)
+
+getwd()
+# Optionally save to CSV
+
+write.csv(backward_results, "backward_citations_openalex.csv", row.names = FALSE)
+write.csv(forward_results, "forward_citations_openalex.csv", row.names = FALSE)
+
+```
+
+
